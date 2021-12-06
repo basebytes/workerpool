@@ -21,11 +21,12 @@ func NewSimplePool(maxSize, waitQueueSize int, maxIdleTime time.Duration) *Simpl
 	s := &SimplePool{
 		maxSize:     maxSize,
 		maxIdleTime: maxIdleTime,
+		sizePtr:     int32(maxSize),
 		waitChan:    make(chan Runnable, waitQueueSize),
 		workers:     make(chan *worker, maxSize),
 		once:        sync.Once{},
+		lock:        sync.RWMutex{},
 	}
-	atomic.StoreInt32(&s.sizePtr, int32(maxSize))
 	return s
 }
 
@@ -36,35 +37,57 @@ type SimplePool struct {
 	maxIdleTime time.Duration
 	workers     chan *worker
 	once        sync.Once
+	lock        sync.RWMutex
+	shutDown    bool
 }
 
 func (s *SimplePool) Start() {
 	s.once.Do(func() {
 		go func() {
-			for {
+			for !s.shutDown||len(s.waitChan)>0{
 				select {
 				case runnable := <-s.waitChan:
 					go s.getWorker().SetRunnable(runnable).run()
 				case <-time.After(s.maxIdleTime):
-					if len(s.workers) > 0 {
-						s.clearChan()
-					}
+					s.clearChan()
 				}
 			}
+			close(s.waitChan)
+			close(s.workers)
+			s.workers=nil
 		}()
 	})
 }
+
 func (s *SimplePool) Submit(runnable Runnable) {
-	s.waitChan <- runnable
+	if !s.shutDown{
+		select{
+			case s.waitChan <- runnable:
+		}
+	}
 }
 
 func (s *SimplePool) Size() int {
 	return s.maxSize
 }
 
+func (s *SimplePool)ShutDown(){
+	s.shutDown=true
+}
+
 func (s *SimplePool) clearChan() {
-	s.workers = make(chan *worker, s.maxSize)
-	atomic.StoreInt32(&s.sizePtr, int32(s.maxSize))
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	if l := int32(len(s.workers)); l > 0 {
+		s.workers = make(chan *worker, s.maxSize)
+		atomic.AddInt32(&s.sizePtr, l)
+	}
+}
+
+func (s *SimplePool) getWorkers() chan *worker {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	return s.workers
 }
 
 func (s *SimplePool) getWorker() *worker {
@@ -75,7 +98,7 @@ func (s *SimplePool) getWorker() *worker {
 		}
 	}
 	select {
-	case w := <-s.workers:
+	case w := <-s.getWorkers():
 		return w
 	}
 }
@@ -89,7 +112,12 @@ type worker struct {
 func (pw *worker) run() {
 	pw.r.Run()
 	pw.r = nil
-	pw.p.workers <- pw
+	if pw.p.getWorkers()!=nil{
+		select{
+			case pw.p.getWorkers() <- pw:
+		}
+	}
+
 }
 
 func (pw *worker) SetRunnable(runnable Runnable) *worker {
